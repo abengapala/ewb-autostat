@@ -44,7 +44,7 @@ EWB_AGENTS = [
     "CPAGAUITAN",
     "GARUFIL",
     "STERNOLA",
-     "SRRUFO",
+    "SRRUFO",
 ]
 
 STATUS_CODES = [
@@ -267,7 +267,8 @@ AGENT_PASSWORD     = "EWB2026"
 SESSION_HOURS      = 12
 LOGIN_SIGNING_KEY  = "ewb-change-this-long-random-string"
 
-ADMIN_PASSWORD     = "SPM2026"     
+ADMIN_PASSWORD     = "SPM2026"
+
 MIN_ACCOUNT_DIGITS = 10   # EWB accounts look like 200057765304 (12 digits)
 
 SUBMISSIONS_SHEET = "EWB_Submissions"
@@ -451,12 +452,12 @@ def clear_submissions(ws=None):
     ws.append_row(SUBMISSIONS_HEADERS)
 
 
-def build_export_workbook(df: pd.DataFrame) -> bytes:
+def build_export_workbook(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
     """Excel with exactly the 8 EWB columns, oldest row first, all as text."""
     out_df = df[EWB_COLUMNS].iloc[::-1].reset_index(drop=True)
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        out_df.to_excel(writer, sheet_name="Sheet1", index=False)
+        out_df.to_excel(writer, sheet_name=sheet_name, index=False)
     return output.getvalue()
 
 
@@ -1002,45 +1003,50 @@ def admin_dashboard():
     # ---------- download ----------
     st.subheader("② Download — EWB Upload File")
     st.caption(
-        "The Excel has exactly the 8 EWB columns (CH CODE → PTP KEPT), oldest row first. "
-        "The first button downloads only rows NOT yet exported and marks them as exported."
+        "Choose which file you need. All three have the same 8 EWB columns (CH CODE → PTP KEPT), "
+        "oldest row first. They follow the filters above."
     )
 
     flash = st.session_state.pop("export_msg", None)
     if flash:
         (st.success if flash[0] == "ok" else st.error)(flash[1])
 
-    to_export = filtered[filtered["EXPORTED"] == 0]
+    mark_after = st.checkbox(
+        "Mark rows as exported after download (only new rows are included)",
+        value=True,
+        key="mark_after",
+    )
+    if not mark_after:
+        st.caption("Marking is OFF: the file contains every row in the current view, and nothing gets marked.")
 
-    d1, d2 = st.columns(2)
-    with d1:
-        if to_export.empty:
-            st.info("Nothing new to export with the current filters.")
-        else:
+    XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    downloads = [
+        # (bucket, button label, file prefix, sheet name, key)
+        ("PTP",   "📅 PTP — with PTP date & amount",      "EWB_PTP",   "PTP",   "dl_ptp"),
+        ("KEPT",  "💳 KEPT — with claim paid date & amount", "EWB_KEPT",  "KEPT",  "dl_kept"),
+        ("OTHER", "📄 OTHER — no PTP / no amount",        "EWB_OTHER", "OTHER", "dl_other"),
+    ]
+    cols = st.columns(3)
+    for col, (bucket, label, prefix, sheet, key) in zip(cols, downloads):
+        group = filtered[filtered["_bucket"] == bucket]
+        if mark_after:
+            group = group[group["EXPORTED"] == 0]
+        with col:
+            if group.empty:
+                st.info(f"{label}\n\nNothing to export.")
+                continue
             st.download_button(
-                label=f"⬇ Download {len(to_export)} new row(s) & mark exported",
-                data=build_export_workbook(to_export),
-                file_name=f"EWB_export_{date.today().isoformat()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_new",
+                label=f"⬇ {label} ({len(group)})",
+                data=build_export_workbook(group, sheet_name=sheet),
+                file_name=f"{prefix}_{date.today().isoformat()}.xlsx",
+                mime=XLSX,
+                key=key,
                 type="primary",
-                on_click=_on_export_download,
-                args=(to_export["ID"].tolist(),),
+                on_click=_on_export_download if mark_after else None,
+                args=(group["ID"].tolist(),) if mark_after else None,
                 use_container_width=True,
             )
-    with d2:
-        if filtered.empty:
-            st.info("No rows in the current view.")
-        else:
-            st.download_button(
-                label=f"⬇ Download current view ({len(filtered)}) — does NOT mark",
-                data=build_export_workbook(filtered),
-                file_name=f"EWB_view_{date.today().isoformat()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_view",
-                use_container_width=True,
-            )
-    st.caption("To re-download rows that were already exported, untick “Hide exported rows” and use the second button.")
+    st.caption("To re-download rows that were already exported, untick “Hide exported rows” above AND untick the marking box.")
 
 
 # ----------------------------------------------------------------------
