@@ -43,7 +43,7 @@ EWB_AGENTS = [
     "JATADEO",
     "CPAGAUITAN",
     "GARUFIL",
-    "STERNOLA"
+    "STERNOLA",
      "SRRUFO",
 ]
 
