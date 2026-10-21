@@ -14,6 +14,9 @@ AGENT SIDE  (normal link)
   Three bookkeeping columns are added after those 8 (ID, EXPORTED, EXPORTED AT).
   They are never included in the downloaded Excel.
 
+  When CHECKING / DOWNLOADING, the date + amount are shown by type:
+    PTP rows  -> PTP DATE, PTP AMOUNT      KEPT rows -> CLAIM PAID DATE, CLAIM PAID AMOUNT
+
 ADMIN SIDE  (open the app link with  ?admin=1  on the end)
   Review every submission, filter / search, see per-agent totals, download the
   EWB-format Excel (new rows get marked as exported), clear test data.
@@ -452,13 +455,177 @@ def clear_submissions(ws=None):
     ws.append_row(SUBMISSIONS_HEADERS)
 
 
-def build_export_workbook(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
-    """Excel with exactly the 8 EWB columns, oldest row first, all as text."""
-    out_df = df[EWB_COLUMNS].iloc[::-1].reset_index(drop=True)
+BASE_COLUMNS = ["CH CODE", "ACCOUNT NUMBER", "STATUS CODE", "REMARKS", "REMARKS BY", "REMARKS DATE"]
+PTP_COLUMNS  = ["PTP DATE", "PTP AMOUNT"]
+KEPT_COLUMNS = ["CLAIM PAID DATE", "CLAIM PAID AMOUNT"]
+
+
+def to_display(df: pd.DataFrame) -> pd.DataFrame:
+    """The sheet stores one date + one amount column (PTP DATE / PTP KEPT).
+    For checking and downloading, split them by type:
+      PTP rows  -> PTP DATE, PTP AMOUNT
+      KEPT rows -> CLAIM PAID DATE, CLAIM PAID AMOUNT
+    """
+    out = df.copy()
+    is_ptp = out["_bucket"] == "PTP"
+    is_kept = out["_bucket"] == "KEPT"
+    src_date, src_amt = df["PTP DATE"], df["PTP KEPT"]
+    out["PTP DATE"] = src_date.where(is_ptp, "")
+    out["PTP AMOUNT"] = src_amt.where(is_ptp, "")
+    out["CLAIM PAID DATE"] = src_date.where(is_kept, "")
+    out["CLAIM PAID AMOUNT"] = src_amt.where(is_kept, "")
+    return out
+
+
+def build_export_workbook(df: pd.DataFrame, sheet_name: str = "Sheet1", kind: str = "PTP") -> bytes:
+    """Excel, oldest row first, all as text.
+    kind="PTP"  -> CH CODE ... REMARKS DATE | PTP DATE | PTP AMOUNT
+    kind="KEPT" -> CH CODE ... REMARKS DATE | CLAIM PAID DATE | CLAIM PAID AMOUNT
+    """
+    tail = KEPT_COLUMNS if kind == "KEPT" else PTP_COLUMNS
+    out_df = to_display(df)[BASE_COLUMNS + tail].iloc[::-1].reset_index(drop=True)
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         out_df.to_excel(writer, sheet_name=sheet_name, index=False)
     return output.getvalue()
+
+
+# ----------------------------------------------------------------------
+# ADMIN EDITING
+# ----------------------------------------------------------------------
+
+def _s(v) -> str:
+    """Cell value -> clean string ('' for None / NaN)."""
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(v).strip()
+
+
+def _parse_date_str(v):
+    t = _s(v)
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(t, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_dt_str(v):
+    t = _s(v)
+    for fmt in ("%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_amt_str(v):
+    t = re.sub(r"[^\d.]", "", _s(v))
+    try:
+        return float(t) if t else None
+    except ValueError:
+        return None
+
+
+def apply_admin_edits(orig: pd.DataFrame, edited: pd.DataFrame, reset_exported=False, ws=None):
+    """Save admin edits back to the sheet.
+
+    orig   = the rows exactly as loaded from the sheet (EWB columns + ID ...)
+    edited = the table the admin edited (display columns: PTP DATE / PTP AMOUNT /
+             CLAIM PAID DATE / CLAIM PAID AMOUNT), same row order as orig.
+
+    All-or-nothing: if ANY edited row is invalid, nothing is saved.
+    Returns (rows_saved, errors).
+    """
+    ws = ws or _ws()
+    shown = to_display(orig)
+    display_cols = BASE_COLUMNS + PTP_COLUMNS + KEPT_COLUMNS
+
+    all_values = ws.get_all_values()
+    if not all_values:
+        return 0, ["The sheet is empty."]
+    header = all_values[0]
+    id_col, exp_col, exp_at_col = header.index("ID"), header.index("EXPORTED"), header.index("EXPORTED AT")
+    row_of = {
+        row[id_col]: n
+        for n, row in enumerate(all_values[1:], start=2)
+        if len(row) > id_col and row[id_col]
+    }
+
+    errors, updates = [], []
+    for i in range(len(orig)):
+        o_shown, e_row, o_raw = shown.iloc[i], edited.iloc[i], orig.iloc[i]
+        if all(_s(o_shown[c]) == _s(e_row[c]) for c in display_cols):
+            continue                                    # untouched row
+
+        rid = _s(o_raw["ID"])
+        label = f"{_s(o_raw['ACCOUNT NUMBER'])} ({_s(o_raw['CH CODE'])})"
+        row_errs = []
+
+        ch = _s(e_row["CH CODE"]).upper()
+        acct = normalize_account(e_row["ACCOUNT NUMBER"])
+        status = _s(e_row["STATUS CODE"])
+        agent = _s(e_row["REMARKS BY"]).upper()
+        remarks = re.sub(r"\s*[\r\n]+\s*", " ", _s(e_row["REMARKS"]))
+        rdt = _parse_dt_str(e_row["REMARKS DATE"])
+
+        if not ch:
+            row_errs.append("CH CODE is empty")
+        if len(acct) < MIN_ACCOUNT_DIGITS:
+            row_errs.append(f"ACCOUNT NUMBER needs at least {MIN_ACCOUNT_DIGITS} digits")
+        if not status:
+            row_errs.append("STATUS CODE is empty")
+        if not agent:
+            row_errs.append("REMARKS BY is empty")
+        if rdt is None:
+            row_errs.append("REMARKS DATE must look like 10/20/2026 08:07:00")
+
+        bucket = _bucket(status)
+        date_out, amt_out = "", ""
+        if bucket in ("PTP", "KEPT"):
+            main, other = (PTP_COLUMNS, KEPT_COLUMNS) if bucket == "PTP" else (KEPT_COLUMNS, PTP_COLUMNS)
+            d_raw = _s(e_row[main[0]]) or _s(e_row[other[0]])   # carry over if the status type changed
+            a_raw = _s(e_row[main[1]]) or _s(e_row[other[1]])
+            d = _parse_date_str(d_raw)
+            a = _parse_amt_str(a_raw)
+            if d is None:
+                row_errs.append(f"{main[0]} must look like 10/21/2026")
+            if a is None or a <= 0:
+                row_errs.append(f"{main[1]} must be a number greater than 0")
+            if d is not None and a is not None and a > 0:
+                date_out, amt_out = d.strftime("%m/%d/%Y"), f"{a:,.2f}"
+
+        if rid not in row_of:
+            row_errs.append("row no longer exists in the sheet")
+
+        if row_errs:
+            errors.append(f"{label}: " + "; ".join(row_errs))
+            continue
+
+        new_vals = [ch, acct, status, remarks, agent, rdt.strftime("%m/%d/%Y %H:%M:%S"), date_out, amt_out]
+        old_vals = [_s(o_raw[c]) for c in EWB_COLUMNS]
+        if new_vals == old_vals:
+            continue                                    # nothing really changed
+
+        r = row_of[rid]
+        updates.append({"range": f"A{r}:{gspread.utils.rowcol_to_a1(r, len(EWB_COLUMNS))}", "values": [new_vals]})
+        if reset_exported and int(o_raw["EXPORTED"]) == 1:
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, exp_col + 1), "values": [[0]]})
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, exp_at_col + 1), "values": [[""]]})
+
+    if errors:
+        return 0, errors
+    if updates:
+        ws.batch_update(updates, value_input_option="RAW")
+    return sum(1 for u in updates if u["range"].startswith("A")), []
 
 
 # ----------------------------------------------------------------------
@@ -861,6 +1028,71 @@ def autostat_form_page():
             st.rerun()
 
 
+def my_submissions_page():
+    """Agents see only their own submissions (newest first)."""
+    who = (st.session_state.get("agent_user") or "").strip().upper()
+
+    st.markdown(
+        f"""
+        <div class="ewb-hero">
+            <div class="ewb-eyebrow">{CAMPAIGN} · Your History</div>
+            <div class="ewb-h1">My <span>Submissions</span></div>
+            <div class="ewb-sub">Everything you submitted under <b>{who}</b> — your proof of submission.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    try:
+        df = load_submissions()
+    except Exception as e:
+        st.error(f"Could not load your submissions: {e}")
+        return
+
+    mine = df[df["REMARKS BY"].str.strip().str.upper() == who]
+    if mine.empty:
+        st.info("You have no submissions yet.")
+        return
+
+    today = date.today()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("📋 Total", len(mine))
+    m2.metric("📅 Today", int((mine["_dt"].dt.date == today).sum()))
+    m3.metric("🤝 PTP", int((mine["_bucket"] == "PTP").sum()))
+    m4.metric("💳 KEPT", int((mine["_bucket"] == "KEPT").sum()))
+
+    s1, s2 = st.columns([3, 1])
+    with s1:
+        search = st.text_input("Search account / CH code", placeholder="type to search...", key="my_search")
+    with s2:
+        st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+        today_only = st.checkbox("Today only", value=False, key="my_today")
+
+    view = mine
+    if today_only:
+        view = view[view["_dt"].dt.date == today]
+    if search.strip():
+        q = search.strip().upper()
+        view = view[
+            view["ACCOUNT NUMBER"].str.contains(q, na=False)
+            | view["CH CODE"].str.upper().str.contains(q, na=False)
+        ]
+
+    view = to_display(view)
+    view["SENT TO EWB"] = view["EXPORTED"].apply(lambda x: "✅ Yes" if int(x) == 1 else "⏳ Pending")
+
+    st.dataframe(
+        view[["CH CODE", "ACCOUNT NUMBER", "STATUS CODE", "REMARKS", "REMARKS DATE"]
+             + PTP_COLUMNS + KEPT_COLUMNS + ["SENT TO EWB"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption(
+        f"Showing {len(view)} of {len(mine)} submission(s). "
+        "“SENT TO EWB: Yes” means admin already pulled it into the upload file."
+    )
+
+
 # ----------------------------------------------------------------------
 # ADMIN
 # ----------------------------------------------------------------------
@@ -991,20 +1223,70 @@ def admin_dashboard():
     if hide_exported:
         filtered = filtered[filtered["EXPORTED"] == 0]
 
-    st.dataframe(
-        filtered[EWB_COLUMNS + ["EXPORTED", "ID"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.caption(f"Showing {len(filtered)} of {len(df)} total submissions.")
+    st.caption(f"Showing {len(filtered)} of {len(df)} total submissions. "
+               "✏️ Click any cell to edit, then press **Save changes** below the table.")
+
+    edit_msg = st.session_state.pop("edit_msg", None)
+    if edit_msg:
+        (st.success if edit_msg[0] == "ok" else st.error)(edit_msg[1])
+
+    if filtered.empty:
+        st.info("No rows in the current view.")
+    else:
+        orig = filtered.reset_index(drop=True)
+        table = to_display(orig)[BASE_COLUMNS + PTP_COLUMNS + KEPT_COLUMNS + ["EXPORTED", "ID"]]
+
+        status_opts = list(STATUS_CODES) + [x for x in table["STATUS CODE"].unique() if x not in STATUS_CODES]
+        agent_opts_edit = list(EWB_AGENTS) + [x for x in table["REMARKS BY"].unique() if x not in EWB_AGENTS]
+
+        # a new key whenever the rows shown change or after a save -> no stale edits
+        ids_sig = hashlib.md5(",".join(orig["ID"]).encode()).hexdigest()[:8]
+        editor_key = f"admin_editor_{st.session_state.get('edit_ver', 0)}_{ids_sig}"
+
+        edited = st.data_editor(
+            table,
+            key=editor_key,
+            hide_index=True,
+            num_rows="fixed",
+            use_container_width=True,
+            disabled=["EXPORTED", "ID"],
+            column_config={
+                "STATUS CODE": st.column_config.SelectboxColumn("STATUS CODE", options=status_opts),
+                "REMARKS BY": st.column_config.SelectboxColumn("REMARKS BY", options=agent_opts_edit),
+                "REMARKS DATE": st.column_config.TextColumn("REMARKS DATE", help="MM/DD/YYYY HH:MM:SS"),
+                "PTP DATE": st.column_config.TextColumn("PTP DATE", help="MM/DD/YYYY"),
+                "PTP AMOUNT": st.column_config.TextColumn("PTP AMOUNT", help="e.g. 319,868.27"),
+                "CLAIM PAID DATE": st.column_config.TextColumn("CLAIM PAID DATE", help="MM/DD/YYYY"),
+                "CLAIM PAID AMOUNT": st.column_config.TextColumn("CLAIM PAID AMOUNT", help="e.g. 319,868.27"),
+            },
+        )
+
+        reset_flag = st.checkbox(
+            "Also mark edited rows as NOT exported (so they appear in the next download again)",
+            value=False, key="reset_after_edit",
+        )
+        if st.button("💾 Save changes", type="primary", key="save_edits"):
+            saved, errs = apply_admin_edits(orig, edited, reset_exported=reset_flag)
+            if errs:
+                st.error("Nothing was saved. Please fix:\n\n" + "\n".join(f"- {e}" for e in errs))
+            elif saved == 0:
+                st.info("No changes to save.")
+            else:
+                st.session_state["edit_msg"] = ("ok", f"✅ Saved {saved} edited row(s).")
+                st.session_state["edit_ver"] = st.session_state.get("edit_ver", 0) + 1
+                st.rerun()
+        st.caption(
+            "Tip: the date + amount follow the status — for PTP statuses they are PTP DATE / PTP AMOUNT, "
+            "for KEPT statuses CLAIM PAID DATE / CLAIM PAID AMOUNT. Changing the status type moves them automatically."
+        )
 
     st.divider()
 
     # ---------- download ----------
     st.subheader("② Download — EWB Upload File")
     st.caption(
-        "Choose which file you need. All three have the same 8 EWB columns (CH CODE → PTP KEPT), "
-        "oldest row first. They follow the filters above."
+        "Choose which file you need, oldest row first. PTP and OTHER files end with PTP DATE + PTP AMOUNT; "
+        "the KEPT file ends with CLAIM PAID DATE + CLAIM PAID AMOUNT. They follow the filters above."
     )
 
     flash = st.session_state.pop("export_msg", None)
@@ -1037,7 +1319,7 @@ def admin_dashboard():
                 continue
             st.download_button(
                 label=f"⬇ {label} ({len(group)})",
-                data=build_export_workbook(group, sheet_name=sheet),
+                data=build_export_workbook(group, sheet_name=sheet, kind="KEPT" if bucket == "KEPT" else "PTP"),
                 file_name=f"{prefix}_{date.today().isoformat()}.xlsx",
                 mime=XLSX,
                 key=key,
@@ -1104,7 +1386,14 @@ def main():
             agent_logout()
             st.rerun()
 
-    autostat_form_page()
+    view_choice = st.radio(
+        "View", ["✦ New Submission", "📋 My Submissions"],
+        horizontal=True, label_visibility="collapsed", key="agent_view",
+    )
+    if view_choice == "📋 My Submissions":
+        my_submissions_page()
+    else:
+        autostat_form_page()
 
 
 if __name__ == "__main__":
