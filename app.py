@@ -43,7 +43,8 @@ EWB_AGENTS = [
     "JATADEO",
     "CPAGAUITAN",
     "GARUFIL",
-    "STERNOLA",
+    "STERNOLA"
+     "SRRUFO",
 ]
 
 STATUS_CODES = [
@@ -266,8 +267,7 @@ AGENT_PASSWORD     = "EWB2026"
 SESSION_HOURS      = 12
 LOGIN_SIGNING_KEY  = "ewb-change-this-long-random-string"
 
-ADMIN_PASSWORD     = "changeme123"      # <-- change this
-
+ADMIN_PASSWORD     = "SPM2026"     
 MIN_ACCOUNT_DIGITS = 10   # EWB accounts look like 200057765304 (12 digits)
 
 SUBMISSIONS_SHEET = "EWB_Submissions"
