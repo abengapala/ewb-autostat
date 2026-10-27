@@ -48,6 +48,12 @@ EWB_AGENTS = [
     "GARUFIL",
     "STERNOLA",
     "SRRUFO",
+    "JGQUINTANS",
+    "TGBORJAL",
+    "CEARCE",
+    "CNAFRADA",
+    "CGELEP",
+    "IDARNAYLA",
 ]
 
 STATUS_CODES = [
