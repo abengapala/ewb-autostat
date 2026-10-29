@@ -54,6 +54,8 @@ EWB_AGENTS = [
     "CNAFRADA",
     "CGELEP",
     "IDARNAYLA",
+     "TBORJAL",
+     
 ]
 
 STATUS_CODES = [
