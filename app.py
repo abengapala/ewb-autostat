@@ -54,7 +54,6 @@ EWB_AGENTS = [
     "CNAFRADA",
     "CGELEP",
     "IDARNAYLA",
-     "TBORJAL",
      
 ]
 
